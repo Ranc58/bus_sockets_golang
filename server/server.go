@@ -17,7 +17,6 @@ var upgrader = websocket.Upgrader{}
 
 var busesInfoToSend = sync.Map{}
 
-//easyjson:json
 type CoordsData struct {
 	MsgType string `json:"msgType"`
 	Data    *WindowCoords
@@ -63,7 +62,7 @@ func (m *MainHandler) sendBusInfo(
 ) error {
 	select {
 	case <-m.Ctx.Done():
-		userConnection.ws.SetWriteDeadline(time.Now().Add(time.Second * 1))
+		_ = userConnection.ws.SetWriteDeadline(time.Now().Add(time.Second * 1))
 		err := userConnection.ws.WriteMessage(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
@@ -89,7 +88,7 @@ func (m *MainHandler) sendBusInfo(
 		})
 		if busesRouteData != nil {
 			busesData.Buses = busesRouteData
-			userConnection.ws.SetWriteDeadline(time.Now().Add(time.Second * 2))
+			_ = userConnection.ws.SetWriteDeadline(time.Now().Add(time.Second * 2))
 			err := userConnection.ws.WriteJSON(&busesData)
 			if err != nil {
 				return err
