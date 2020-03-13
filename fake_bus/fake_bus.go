@@ -25,17 +25,18 @@ type BusInfo struct {
 }
 
 type BusImitator struct {
-	ctx context.Context
-	serverAddress string
+	ctx            context.Context
+	serverAddress  string
 	refreshTimeout int
-	routesCount int
-	busInfoChans []chan *buses.BusRouteData
-	busesPerRoute int
-	wg *sync.WaitGroup
+	routesCount    int
+	busInfoChans   []chan *buses.BusRouteData
+	busesPerRoute  int
+	wg             *sync.WaitGroup
 }
 
-
-func (b *BusImitator) initWs(readyWs chan struct{}){
+func (b *BusImitator) initWs(
+	readyWs chan struct{},
+) {
 	wg := sync.WaitGroup{}
 	for i := 0; i < *wsCount; i++ {
 		busInfoCh := make(chan *buses.BusRouteData, 0)
@@ -43,19 +44,44 @@ func (b *BusImitator) initWs(readyWs chan struct{}){
 		wg.Add(1)
 		go b.spawnBusFromCh(busInfoCh, &wg)
 	}
-	readyWs <- struct {}{}
+	readyWs <- struct{}{}
 	wg.Wait()
 }
 
+func ReadBusDataFromFile(
+	routesDir string,
+	fileName string,
+	busDataCh chan<- []byte,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+	fullPath := path.Join(routesDir, fileName)
+	f, err := os.Open(fullPath)
+	if err != nil {
+		log.Printf("unable to open file: %s\n", err)
+	}
+	fileContent, err := ioutil.ReadAll(f)
+	if err != nil {
+		log.Printf("unable to read file: %s\n", err)
+	}
+	_ = f.Close()
+	busDataCh <- fileContent
+}
 
-func (b *BusImitator) processBuses(files []os.FileInfo, routesDir string) {
+func (b *BusImitator) processRoutes(
+	files []os.FileInfo,
+	routesDir string,
+) {
 	wg := sync.WaitGroup{}
 	for i := 0; i < b.routesCount; i++ {
+		busDataChan := make(chan []byte, b.routesCount)
 		fileInfo := files[i]
 		rand.Seed(time.Now().UnixNano())
 		busInfoChan := b.busInfoChans[rand.Intn(len(b.busInfoChans))]
 		wg.Add(1)
-		go b.spawnRoute(routesDir, fileInfo, busInfoChan, &wg)
+		go ReadBusDataFromFile(routesDir, fileInfo.Name(), busDataChan, &wg)
+		wg.Add(1)
+		go b.spawnRoute(busDataChan, busInfoChan, &wg)
 	}
 	wg.Wait()
 }
@@ -65,16 +91,15 @@ func (b *BusImitator) spawnBusFromCh(
 	wg *sync.WaitGroup,
 ) {
 	u := url.URL{Scheme: "ws", Host: "127.0.0.1:8080", Path: "/"}
-	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	ws, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		log.Fatal("dial:", err)
 	}
-
 	done := make(chan struct{})
 	ticker := time.NewTicker(time.Duration(b.refreshTimeout) * time.Millisecond)
 	defer func() {
 		wg.Done()
-		c.Close()
+		_ = ws.Close()
 		close(done)
 		ticker.Stop()
 	}()
@@ -85,7 +110,7 @@ func (b *BusImitator) spawnBusFromCh(
 			case <-b.ctx.Done():
 				return
 			default:
-				_, _, err := c.ReadMessage()
+				_, _, err := ws.ReadMessage()
 				if err != nil {
 					return
 				}
@@ -97,12 +122,11 @@ func (b *BusImitator) spawnBusFromCh(
 		select {
 		case busInfo := <-busInfoCh:
 			msg, err := busInfo.MarshalJSON()
-			if err != nil{
+			if err != nil {
 				log.Println("marshal error:", err)
 				return
 			}
-			c.SetWriteDeadline(time.Now().Add(time.Second * 2))
-			err = c.WriteMessage(websocket.BinaryMessage, msg)
+			err = ws.WriteMessage(websocket.BinaryMessage, msg)
 			if err != nil {
 				log.Println("write send:", err)
 				return
@@ -113,7 +137,7 @@ func (b *BusImitator) spawnBusFromCh(
 		case <-b.ctx.Done():
 			// Cleanly close the connection by sending a close message and then
 			// waiting (with timeout) for the server to close the connection.
-			err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			err := ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 			if err != nil {
 				log.Println("write close:", err)
 				return
@@ -145,7 +169,6 @@ func (b *BusImitator) sendBusToCh(
 			randOffset := rand.Intn(len(coords) / 2)
 			coords = coords[randOffset:]
 		}
-		fmt.Printf("%s-%t %d\n", busId, firstRun, len(coords))
 		for _, coord := range coords {
 			busData := buses.BusRouteData{
 				BusID: busId,
@@ -160,7 +183,7 @@ func (b *BusImitator) sendBusToCh(
 			}
 		}
 
-		if firstRun{
+		if firstRun {
 			firstRun = false
 			coords = InfoSender.Info.Coordinates
 		}
@@ -172,8 +195,7 @@ func (b *BusImitator) sendBusToCh(
 }
 
 func (b *BusImitator) spawnRoute(
-	routesDir string,
-	fileInfo os.FileInfo,
+	busDataChan <-chan []byte,
 	busInfoCh chan<- *buses.BusRouteData,
 	wg *sync.WaitGroup,
 ) {
@@ -182,20 +204,9 @@ func (b *BusImitator) spawnRoute(
 		sendBusWg.Wait()
 		wg.Done()
 	}()
-	fullPath := path.Join(routesDir, fileInfo.Name())
-	f, err := os.Open(fullPath)
-	if err != nil {
-		log.Printf("unable to open file: %s\n", err)
-		return
-	}
-	fileContent, err := ioutil.ReadAll(f)
-	if err != nil {
-		log.Printf("unable to open file: %s\n", err)
-		return
-	}
-	_ = f.Close()
+	fileContent := <-busDataChan
 	data := buses.RouteInfo{}
-	err = data.UnmarshalJSON(fileContent)
+	err := data.UnmarshalJSON(fileContent)
 	if err != nil {
 		log.Printf("unable to unmarshal json: %s\n", err)
 		return
@@ -247,15 +258,15 @@ func main() {
 		ctx:            ctx,
 		serverAddress:  *serverAddr,
 		refreshTimeout: *refreshTimeout,
-		routesCount: *routesCount,
+		routesCount:    *routesCount,
 		busesPerRoute:  *busesPerRoute,
-		busInfoChans: []chan *buses.BusRouteData{},
+		busInfoChans:   []chan *buses.BusRouteData{},
 	}
 	readyWs := make(chan struct{})
 	go imitator.initWs(readyWs)
 	<-readyWs
-	fmt.Printf("Start listen server as: 127.0.0.1:8080\n")
-	imitator.processBuses(files, routesDir)
+	fmt.Printf("Start imitator\n")
+	imitator.processRoutes(files, routesDir)
 	<-done
 	fmt.Println("DONE OK")
 }
