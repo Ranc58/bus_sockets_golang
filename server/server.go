@@ -3,7 +3,6 @@ package main
 import (
 	"bus_sockets/buses"
 	"context"
-	"fmt"
 	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
@@ -15,30 +14,57 @@ import (
 )
 
 var upgrader = websocket.Upgrader{}
-//var busesInfoToSend = map[string]buses.BusRouteData{}
+
 var busesInfoToSend = sync.Map{}
 
+//easyjson:json
+type CoordsData struct {
+	MsgType string `json:"msgType"`
+	Data    *WindowCoords
+}
+
+type UserConnection struct {
+	ws     *websocket.Conn
+	coords *WindowCoords
+}
+
+func (u *UserConnection) isBusInside(
+	lat float64,
+	lng float64,
+) bool {
+	if u.coords == nil {
+		return false
+	}
+	latInside := u.coords.SouthLat <= lat && lat <= u.coords.NorthLat
+	lngInside := u.coords.WestLng <= lng && lng <= u.coords.EastLng
+	return latInside && lngInside
+}
+
+type WindowCoords struct {
+	EastLng  float64 `json:"east_lng"`
+	NorthLat float64 `json:"north_lat"`
+	SouthLat float64 `json:"south_lat"`
+	WestLng  float64 `json:"west_lng"`
+}
 
 type MainHandler struct {
 	Ctx context.Context
-	mx sync.RWMutex
+	mx  sync.RWMutex
 }
 
 type ListenHandler struct {
 	Ctx context.Context
-	mx sync.Mutex
+	mx  sync.Mutex
 }
 
-
-func sendBusInfo(
-	ctx context.Context,
-	ws *websocket.Conn,
+func (m *MainHandler) sendBusInfo(
+	userConnection *UserConnection,
 	busesData *buses.BusesData,
-	) error {
+) error {
 	select {
-	case <- ctx.Done():
-		ws.SetWriteDeadline(time.Now().Add(time.Second * 2))
-		err := ws.WriteMessage(
+	case <-m.Ctx.Done():
+		userConnection.ws.SetWriteDeadline(time.Now().Add(time.Second * 1))
+		err := userConnection.ws.WriteMessage(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 		if err != nil {
@@ -55,17 +81,43 @@ func sendBusInfo(
 			if !ok {
 				return false
 			}
-			busesRouteData = append(busesRouteData, val)
-			return true
+			if userConnection.isBusInside(val.Lat, val.Lng) {
+				busesRouteData = append(busesRouteData, val)
+			}
 
+			return true
 		})
-		busesData.Buses = busesRouteData
-		ws.SetWriteDeadline(time.Now().Add(time.Second * 2))
-		err := ws.WriteJSON(&busesData)
-		if err != nil {
-			return err
+		if busesRouteData != nil {
+			busesData.Buses = busesRouteData
+			userConnection.ws.SetWriteDeadline(time.Now().Add(time.Second * 2))
+			err := userConnection.ws.WriteJSON(&busesData)
+			if err != nil {
+				return err
+			}
 		}
 		return nil
+	}
+}
+
+func (m *MainHandler) listenBrowser(
+	ws *websocket.Conn,
+	userConnection *UserConnection,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+	for {
+		select {
+		case <-m.Ctx.Done():
+			return
+		default:
+			var coordsData CoordsData
+			err := ws.ReadJSON(&coordsData)
+			if err != nil {
+				return
+			}
+			userConnection.coords = coordsData.Data
+			//fmt.Println(coordsData)
+		}
 	}
 }
 
@@ -76,26 +128,33 @@ func (m *MainHandler) wsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Print("upgrade:", err)
 		return
 	}
+	userConnection := UserConnection{
+		ws: ws,
+	}
+
 	defer ws.Close()
 	busesData := buses.BusesData{
 		MsgType: "Buses",
 	}
+
+	wg := sync.WaitGroup{}
+	defer wg.Wait()
+	wg.Add(1)
+	go m.listenBrowser(ws, &userConnection, &wg)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		err := sendBusInfo(m.Ctx, ws, &busesData)
+		err := m.sendBusInfo(&userConnection, &busesData)
 		if err != nil {
 			return
 		}
 		<-ticker.C
-		}
 	}
+}
 
-
-func getBusInfo(ctx context.Context, ws *websocket.Conn) error{
-	
+func getBusInfo(ctx context.Context, ws *websocket.Conn) error {
 	select {
-	case <- ctx.Done():
+	case <-ctx.Done():
 		return nil
 	default:
 		busData := buses.BusRouteData{}
@@ -103,13 +162,13 @@ func getBusInfo(ctx context.Context, ws *websocket.Conn) error{
 		if err != nil {
 			return err
 		}
-		fmt.Println(busData)
+		//fmt.Println(busData)
 		busesInfoToSend.Store(busData.BusID, busData)
 	}
 	return nil
 }
 
-func (l *ListenHandler) listenHandler(w http.ResponseWriter, r *http.Request){
+func (l *ListenHandler) listenHandler(w http.ResponseWriter, r *http.Request) {
 	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -125,7 +184,6 @@ func (l *ListenHandler) listenHandler(w http.ResponseWriter, r *http.Request){
 	}
 }
 
-
 func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -135,27 +193,27 @@ func main() {
 	signal.Notify(shutDownCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-shutDownCh
-		log.Printf("Shutdown by signal: %s", sig)
 		cancel()
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second)
+		log.Printf("Shutdown by signal: %s", sig)
 		done <- true
-	}()
 
+	}()
 
 	go func() {
 
-		mHandler := MainHandler{Ctx:ctx}
+		mHandler := MainHandler{Ctx: ctx}
 		http.HandleFunc("/ws", mHandler.wsHandler)
 		log.Println("Start ws server as :8000")
 		http.ListenAndServe(":8000", nil)
 	}()
 	go func() {
 
-		lHandler := ListenHandler{Ctx:ctx}
+		lHandler := ListenHandler{Ctx: ctx}
 		http.HandleFunc("/", lHandler.listenHandler)
 		log.Println("Start listen server as :8080")
 		http.ListenAndServe(":8080", nil)
 	}()
 
-	<- done
+	<-done
 }
