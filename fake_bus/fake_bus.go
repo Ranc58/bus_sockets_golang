@@ -2,15 +2,14 @@ package main
 
 import (
 	"bus_sockets/buses"
+	"bus_sockets/services"
 	"context"
 	"flag"
 	"fmt"
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 	"io/ioutil"
 	"log"
 	"math/rand"
-	"net/url"
 	"os"
 	"os/signal"
 	"path"
@@ -31,9 +30,10 @@ type BusImitator struct {
 	routesCount    int
 	busInfoChans   []chan *buses.BusRouteData
 	busesPerRoute  int
+	rabbit         services.Rabbit
 }
 
-func (b *BusImitator) initWs(
+func (b *BusImitator) initBusChans(
 	readyWs chan struct{},
 ) {
 	wg := sync.WaitGroup{}
@@ -88,37 +88,14 @@ func (b *BusImitator) processRoutes(
 			defer wg.Done()
 			go b.spawnRoute(busDataChan, busInfoChan)
 		}(&wg)
-
 	}
 	wg.Wait()
 }
 
 func (b *BusImitator) spawnBusFromCh(busInfoCh <-chan *buses.BusRouteData) {
-	u := url.URL{Scheme: "ws", Host: "127.0.0.1:8080", Path: "/"}
-	ws, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-	if err != nil {
-		log.Fatal("dial:", err)
-	}
-	done := make(chan struct{})
 	ticker := time.NewTicker(time.Duration(b.refreshTimeout) * time.Millisecond)
 	defer func() {
-		_ = ws.Close()
-		close(done)
 		ticker.Stop()
-	}()
-	go func() {
-		for {
-			select {
-			case <-b.ctx.Done():
-				return
-			default:
-				_, _, err := ws.ReadMessage()
-				if err != nil {
-					return
-				}
-			}
-
-		}
 	}()
 	for {
 		select {
@@ -128,30 +105,14 @@ func (b *BusImitator) spawnBusFromCh(busInfoCh <-chan *buses.BusRouteData) {
 				log.Println("marshal error:", err)
 				return
 			}
-			err = ws.WriteMessage(websocket.BinaryMessage, msg)
-			if err != nil {
-				log.Println("write send:", err)
-				return
-			}
+
+			b.rabbit.SendData(msg)
 			<-ticker.C
-		case <-done:
-			return
 		case <-b.ctx.Done():
-			// Cleanly close the connection by sending a close message and then
-			// waiting (with timeout) for the server to close the connection.
-			err := ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			if err != nil {
-				log.Println("write close:", err)
-				return
-			}
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-			}
+
 			return
 		}
 	}
-
 }
 
 func (b *BusImitator) sendBusToCh(
@@ -232,10 +193,19 @@ func main() {
 	shutDownCh := make(chan os.Signal, 1)
 	done := make(chan bool, 1)
 	signal.Notify(shutDownCh, syscall.SIGINT, syscall.SIGTERM)
+	imitator := BusImitator{
+		ctx:            ctx,
+		serverAddress:  *serverAddr,
+		refreshTimeout: *refreshTimeout,
+		routesCount:    *routesCount,
+		busesPerRoute:  *busesPerRoute,
+		busInfoChans:   []chan *buses.BusRouteData{},
+	}
 	go func() {
 		sig := <-shutDownCh
 		log.Printf("Shutdown by signal: %s", sig)
 		cancel()
+		imitator.rabbit.Stop()
 		time.Sleep(1 * time.Second)
 		done <- true
 	}()
@@ -254,17 +224,16 @@ func main() {
 		return
 	}
 
-	imitator := BusImitator{
-		ctx:            ctx,
-		serverAddress:  *serverAddr,
-		refreshTimeout: *refreshTimeout,
-		routesCount:    *routesCount,
-		busesPerRoute:  *busesPerRoute,
-		busInfoChans:   []chan *buses.BusRouteData{},
-	}
-	readyWs := make(chan struct{})
-	go imitator.initWs(readyWs)
-	<-readyWs
+	readyRQ := make(chan struct{})
+	imitator.rabbit.Start(
+		"localhost",
+		"5672",
+		"rabbitmq",
+		"rabbitmq",
+	) // Todo add host data from args
+	go imitator.initBusChans(readyRQ)
+	<-readyRQ
+
 	fmt.Printf("Start imitator\n")
 	imitator.processRoutes(files, routesDir)
 	<-done
