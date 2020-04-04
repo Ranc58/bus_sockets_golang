@@ -37,7 +37,7 @@ func (b *BusImitator) initBusChans(
 	readyWs chan struct{},
 ) {
 	wg := sync.WaitGroup{}
-	for i := 0; i < *wsCount; i++ {
+	for i := 0; i < *chansCount; i++ {
 		busInfoCh := make(chan *buses.BusRouteData, 0)
 		b.busInfoChans = append(b.busInfoChans, busInfoCh)
 		wg.Add(1)
@@ -181,11 +181,14 @@ func (b *BusImitator) spawnRoute(
 	}
 }
 
-var serverAddr = flag.String("server", "127.0.0.1:8080", "Address:port of gate service")
-var routesCount = flag.Int("routes", 10, "Count of routes")
-var busesPerRoute = flag.Int("buses", 10, "Count of buses on one route")
-var wsCount = flag.Int("sockets", 10, "Count of WebSockets")
-var refreshTimeout = flag.Int("refresh", 500, "Refresh timeout (on milliseconds)")
+var rabbitHost = flag.String("r_host", "127.0.0.1", "RabbitMQ host")
+var rabbitPort = flag.Int("r_port", 5672, "RabbitMQ port")
+var rabbitLogin = flag.String("r_login", "rabbitmq", "RabbitMQ login")
+var rabbitPass = flag.String("r_pass", "rabbitmq", "RabbitMQ password")
+var routesCount = flag.Int("routes", 20, "Count of routes")
+var busesPerRoute = flag.Int("buses", 5, "Count of buses on one route")
+var refreshTimeout = flag.Int("refresh", 100, "Refresh timeout (on milliseconds)")
+var chansCount = flag.Int("chans", 10, "Count of parallel Golang chans for send bus data to rabbit")
 
 func main() {
 	flag.Parse()
@@ -195,7 +198,6 @@ func main() {
 	signal.Notify(shutDownCh, syscall.SIGINT, syscall.SIGTERM)
 	imitator := BusImitator{
 		ctx:            ctx,
-		serverAddress:  *serverAddr,
 		refreshTimeout: *refreshTimeout,
 		routesCount:    *routesCount,
 		busesPerRoute:  *busesPerRoute,
@@ -226,16 +228,17 @@ func main() {
 
 	readyRQ := make(chan struct{})
 	imitator.rabbit.Start(
-		"localhost",
-		"5672",
-		"rabbitmq",
-		"rabbitmq",
-	) // Todo add host data from args
+		*rabbitHost,
+		*rabbitLogin,
+		*rabbitPass,
+		*rabbitPort,
+	)
 	go imitator.initBusChans(readyRQ)
 	<-readyRQ
 
 	fmt.Printf("Start imitator\n")
 	imitator.processRoutes(files, routesDir)
 	<-done
+
 	fmt.Println("DONE OK")
 }
