@@ -2,8 +2,11 @@ package main
 
 import (
 	"bus_sockets/buses"
+	"bus_sockets/services"
 	"context"
+	"flag"
 	"github.com/gorilla/websocket"
+	"github.com/streadway/amqp"
 	"log"
 	"net/http"
 	"os"
@@ -47,11 +50,8 @@ type WindowCoords struct {
 }
 
 type MainHandler struct {
-	Ctx context.Context
-}
-
-type ListenHandler struct {
-	Ctx context.Context
+	Ctx      context.Context
+	RabbitCh <-chan amqp.Delivery
 }
 
 func (m *MainHandler) sendBusInfo(
@@ -149,37 +149,29 @@ func (m *MainHandler) wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func getBusInfo(ctx context.Context, ws *websocket.Conn) error {
-	select {
-	case <-ctx.Done():
-		return nil
-	default:
-		busData := buses.BusRouteData{}
-		err := ws.ReadJSON(&busData)
-		if err != nil {
-			return err
+func getBusInfoFromRabbit(ctx context.Context, msgs <-chan amqp.Delivery) error {
+	for d := range msgs {
+
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			busData := buses.BusRouteData{}
+			err := busData.UnmarshalJSON(d.Body)
+			log.Printf(" [X] Recieve %s\n", busData.BusID)
+			if err != nil {
+				return err
+			}
+			busesInfoToSend.Store(busData.BusID, busData)
 		}
-		//fmt.Println(busData)
-		busesInfoToSend.Store(busData.BusID, busData)
 	}
 	return nil
 }
 
-func (l *ListenHandler) listenHandler(w http.ResponseWriter, r *http.Request) {
-	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Print("upgrade:", err)
-		return
-	}
-	defer ws.Close()
-	for {
-		err := getBusInfo(l.Ctx, ws)
-		if err != nil {
-			return
-		}
-	}
-}
+var rabbitHost = flag.String("r_host", "127.0.0.1", "RabbitMQ host")
+var rabbitPort = flag.Int("r_port", 5672, "RabbitMQ port")
+var rabbitLogin = flag.String("r_login", "rabbitmq", "RabbitMQ login")
+var rabbitPass = flag.String("r_pass", "rabbitmq", "RabbitMQ password")
 
 func main() {
 
@@ -188,29 +180,40 @@ func main() {
 	done := make(chan bool, 1)
 
 	signal.Notify(shutDownCh, syscall.SIGINT, syscall.SIGTERM)
+	rabbit := services.Rabbit{}
 	go func() {
 		sig := <-shutDownCh
 		cancel()
 		time.Sleep(1 * time.Second)
 		log.Printf("Shutdown by signal: %s", sig)
+		rabbit.Stop()
 		done <- true
-
 	}()
 
-	go func() {
+	rabbit.Start(
+		*rabbitHost,
+		*rabbitLogin,
+		*rabbitPass,
+		*rabbitPort,
+	)
+	messagesCh := rabbit.GetConsumeChan()
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func(wg *sync.WaitGroup) {
+		defer wg.Done()
+		err := getBusInfoFromRabbit(ctx, messagesCh)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}(&wg)
 
-		mHandler := MainHandler{Ctx: ctx}
+	go func() {
+		mHandler := MainHandler{Ctx: ctx, RabbitCh: messagesCh}
 		http.HandleFunc("/ws", mHandler.wsHandler)
 		log.Println("Start ws server as :8000")
 		http.ListenAndServe(":8000", nil)
 	}()
-	go func() {
 
-		lHandler := ListenHandler{Ctx: ctx}
-		http.HandleFunc("/", lHandler.listenHandler)
-		log.Println("Start listen server as :8080")
-		http.ListenAndServe(":8080", nil)
-	}()
-
+	wg.Wait()
 	<-done
 }
