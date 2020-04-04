@@ -31,7 +31,6 @@ type BusImitator struct {
 	routesCount    int
 	busInfoChans   []chan *buses.BusRouteData
 	busesPerRoute  int
-	wg             *sync.WaitGroup
 }
 
 func (b *BusImitator) initWs(
@@ -42,7 +41,10 @@ func (b *BusImitator) initWs(
 		busInfoCh := make(chan *buses.BusRouteData, 0)
 		b.busInfoChans = append(b.busInfoChans, busInfoCh)
 		wg.Add(1)
-		go b.spawnBusFromCh(busInfoCh, &wg)
+		go func(wg *sync.WaitGroup) {
+			defer wg.Done()
+			go b.spawnBusFromCh(busInfoCh)
+		}(&wg)
 	}
 	readyWs <- struct{}{}
 	wg.Wait()
@@ -52,9 +54,7 @@ func ReadBusDataFromFile(
 	routesDir string,
 	fileName string,
 	busDataCh chan<- []byte,
-	wg *sync.WaitGroup,
 ) {
-	defer wg.Done()
 	fullPath := path.Join(routesDir, fileName)
 	f, err := os.Open(fullPath)
 	if err != nil {
@@ -79,17 +79,21 @@ func (b *BusImitator) processRoutes(
 		rand.Seed(time.Now().UnixNano())
 		busInfoChan := b.busInfoChans[rand.Intn(len(b.busInfoChans))]
 		wg.Add(1)
-		go ReadBusDataFromFile(routesDir, fileInfo.Name(), busDataChan, &wg)
+		go func(wg *sync.WaitGroup) {
+			defer wg.Done()
+			go ReadBusDataFromFile(routesDir, fileInfo.Name(), busDataChan)
+		}(&wg)
 		wg.Add(1)
-		go b.spawnRoute(busDataChan, busInfoChan, &wg)
+		go func(wg *sync.WaitGroup) {
+			defer wg.Done()
+			go b.spawnRoute(busDataChan, busInfoChan)
+		}(&wg)
+
 	}
 	wg.Wait()
 }
 
-func (b *BusImitator) spawnBusFromCh(
-	busInfoCh <-chan *buses.BusRouteData,
-	wg *sync.WaitGroup,
-) {
+func (b *BusImitator) spawnBusFromCh(busInfoCh <-chan *buses.BusRouteData) {
 	u := url.URL{Scheme: "ws", Host: "127.0.0.1:8080", Path: "/"}
 	ws, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
@@ -98,13 +102,11 @@ func (b *BusImitator) spawnBusFromCh(
 	done := make(chan struct{})
 	ticker := time.NewTicker(time.Duration(b.refreshTimeout) * time.Millisecond)
 	defer func() {
-		wg.Done()
 		_ = ws.Close()
 		close(done)
 		ticker.Stop()
 	}()
 	go func() {
-
 		for {
 			select {
 			case <-b.ctx.Done():
@@ -197,12 +199,10 @@ func (b *BusImitator) sendBusToCh(
 func (b *BusImitator) spawnRoute(
 	busDataChan <-chan []byte,
 	busInfoCh chan<- *buses.BusRouteData,
-	wg *sync.WaitGroup,
 ) {
 	sendBusWg := sync.WaitGroup{}
 	defer func() {
 		sendBusWg.Wait()
-		wg.Done()
 	}()
 	fileContent := <-busDataChan
 	data := buses.RouteInfo{}

@@ -48,12 +48,10 @@ type WindowCoords struct {
 
 type MainHandler struct {
 	Ctx context.Context
-	mx  sync.RWMutex
 }
 
 type ListenHandler struct {
 	Ctx context.Context
-	mx  sync.Mutex
 }
 
 func (m *MainHandler) sendBusInfo(
@@ -101,9 +99,7 @@ func (m *MainHandler) sendBusInfo(
 func (m *MainHandler) listenBrowser(
 	ws *websocket.Conn,
 	userConnection *UserConnection,
-	wg *sync.WaitGroup,
 ) {
-	defer wg.Done()
 	for {
 		select {
 		case <-m.Ctx.Done():
@@ -115,7 +111,6 @@ func (m *MainHandler) listenBrowser(
 				return
 			}
 			userConnection.coords = coordsData.Data
-			//fmt.Println(coordsData)
 		}
 	}
 }
@@ -139,7 +134,10 @@ func (m *MainHandler) wsHandler(w http.ResponseWriter, r *http.Request) {
 	wg := sync.WaitGroup{}
 	defer wg.Wait()
 	wg.Add(1)
-	go m.listenBrowser(ws, &userConnection, &wg)
+	go func(wg *sync.WaitGroup) {
+		defer wg.Done()
+		m.listenBrowser(ws, &userConnection)
+	}(&wg)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
