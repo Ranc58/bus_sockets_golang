@@ -31,14 +31,14 @@ func (r *Rabbit) Start(host, login, password string, port int) {
 
 	ch, err := conn.Channel()
 	failOnError(err, "Failed to open a channel")
-
+	args := amqp.Table{"x-message-ttl": 5 * 1000} // 5 sec
 	q, err := ch.QueueDeclare(
 		"buses", // name
 		false,   // durable
 		false,   // delete when unused
 		false,   // exclusive
 		false,   // no-wait
-		nil,     // arguments
+		args,    // arguments
 	)
 	failOnError(err, "Failed to declare a queue")
 	r.connection = conn
